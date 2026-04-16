@@ -7,6 +7,7 @@ Render Standard Background Worker for:
 - Shadow baseline comparison (sampling only)
 - Queue-based async processing
 - #201 P1: flow_change_detection, over_segmentation_check (rule-based)
+- #201 P2: under_segmentation_check, provisional_enrichment (rule-based)
 
 v1 Constraints:
 - NO context_packs modification
@@ -32,7 +33,7 @@ logging.basicConfig(
 logger = logging.getLogger('5by-pack-worker')
 
 # Worker version
-WORKER_VERSION = 'v0.2.0'
+WORKER_VERSION = 'v0.3.0'
 
 # Polling interval (seconds)
 POLL_INTERVAL = 10
@@ -312,10 +313,171 @@ def handle_over_segmentation_check(supabase: Client, job_id: str, pack_id: Optio
     logger.info(f'Job {job_id}: over_segmentation_check should_suppress={should_suppress}')
 
 
+def handle_under_segmentation_check(supabase: Client, job_id: str, pack_id: Optional[str], payload: Dict[str, Any]) -> None:
+    """
+    #201 P2: under_segmentation_check handler (rule-based).
+
+    Rules:
+    - Previous pack gap < 3min → merge_candidate_detected=True (too_short_gap)
+    - Previous pack message_count < 3 AND current pack message_count < 3 → merge_candidate_detected=True (both_small)
+    - Otherwise → merge_candidate_detected=False
+
+    CRITICAL: merge_candidate_detected is diagnostic-only recommendation.
+    It does NOT merge packs by itself.
+    Canonical pack merge remains prohibited.
+
+    Canonical tables: SELECT-only (no write).
+    Output: worker_diagnostics.rule_engine_result JSONB.
+    """
+    conversation_id = validate_required_payload_fields(supabase, job_id, pack_id, payload)
+    if not conversation_id:
+        return
+
+    # SELECT-only: get current pack
+    current_pack = supabase.table('context_packs').select('id, conversation_id, created_at, message_count').eq('id', pack_id).single().execute().data
+    if not current_pack or current_pack.get('conversation_id') != conversation_id:
+        mark_job_failed(supabase, job_id, 'invalid_payload: pack not found or conversation mismatch')
+        return
+
+    current_created_at = current_pack.get('created_at')
+    current_message_count = int(current_pack.get('message_count') or 0)
+
+    # SELECT-only: get previous pack
+    prev_packs = supabase.table('context_packs').select('id, created_at, message_count').eq('conversation_id', conversation_id).lt('created_at', current_created_at).order('created_at', desc=True).limit(1).execute().data
+
+    merge_candidate_detected = False
+    merge_candidate_pack_id = None
+    reason_code = 'none'
+    reason = 'rule: no_merge_candidate'
+
+    if prev_packs:
+        prev_pack = prev_packs[0]
+        merge_candidate_pack_id = prev_pack.get('id')
+        prev_message_count = int(prev_pack.get('message_count') or 0)
+
+        try:
+            curr_dt = datetime.fromisoformat(str(current_created_at).replace('Z', '+00:00'))
+            prev_dt = datetime.fromisoformat(str(prev_pack.get('created_at')).replace('Z', '+00:00'))
+            gap_minutes = (curr_dt - prev_dt).total_seconds() / 60.0
+
+            if gap_minutes < 3.0:
+                merge_candidate_detected = True
+                reason_code = 'too_short_gap'
+                reason = 'rule: pack_gap_lt_3min'
+            elif prev_message_count < 3 and current_message_count < 3:
+                merge_candidate_detected = True
+                reason_code = 'both_small'
+                reason = 'rule: both_packs_message_count_lt_3'
+        except Exception:
+            reason = 'rule: created_at_parse_failed'
+
+    rule_engine_result = build_rule_engine_result_namespace(
+        job_type='under_segmentation_check',
+        output_type='under_segmentation_signal',
+        output={
+            'type': 'under_segmentation_signal',
+            'pack_id': pack_id,
+            'merge_candidate_detected': merge_candidate_detected,
+            'merge_candidate_pack_id': merge_candidate_pack_id,
+            'reason_code': reason_code,
+            'reason': reason
+        }
+    )
+
+    record_rule_engine_diagnostics(supabase, job_id, pack_id, rule_engine_result)
+    logger.info(f'Job {job_id}: under_segmentation_check merge_candidate_detected={merge_candidate_detected}')
+
+
+def handle_provisional_enrichment(supabase: Client, job_id: str, pack_id: Optional[str], payload: Dict[str, Any]) -> None:
+    """
+    #201 P2: provisional_enrichment handler (rule-based only).
+
+    P2 scope: rule only. LLM mode is gated (off until B document activation).
+
+    Access path:
+    1. context_packs: first_message_seq, last_message_seq
+    2. raw_messages: conversation_id + sequence window
+       - role='user' -> provisional_title
+       - role='assistant' -> provisional_brief
+
+    CRITICAL: provisional_title/brief are diagnostic-only recommendations.
+    They do NOT update context_packs.title directly.
+    Canonical promotion requires separate Gate.
+
+    Canonical tables: SELECT-only (no write).
+    Output: worker_diagnostics.rule_engine_result JSONB.
+    """
+    conversation_id = validate_required_payload_fields(supabase, job_id, pack_id, payload)
+    if not conversation_id:
+        return
+
+    enrichment_mode = payload.get('enrichment_mode', 'rule')
+
+    # P2: LLM mode is gated (not enabled)
+    if enrichment_mode == 'llm':
+        mark_job_skipped(supabase, job_id, 'llm mode not enabled in P2 (gated)')
+        return
+
+    # SELECT-only: get current pack with first_message_seq
+    current_pack = supabase.table('context_packs').select('id, conversation_id, first_message_seq, last_message_seq').eq('id', pack_id).single().execute().data
+    if not current_pack or current_pack.get('conversation_id') != conversation_id:
+        mark_job_failed(supabase, job_id, 'invalid_payload: pack not found or conversation mismatch')
+        return
+
+    first_seq = current_pack.get('first_message_seq')
+    last_seq = current_pack.get('last_message_seq')
+    if first_seq is None:
+        mark_job_failed(supabase, job_id, 'invalid_payload: pack has no first_message_seq')
+        return
+
+    provisional_title = None
+    provisional_brief = None
+    confidence = 0.3
+
+    window_last_seq = last_seq if last_seq else first_seq + 10
+
+    # SELECT-only: get first user message for title
+    user_msgs = supabase.table('raw_messages').select('content').eq('conversation_id', conversation_id).eq('role', 'user').gte('sequence', first_seq).lte('sequence', window_last_seq).order('sequence', desc=False).limit(1).execute().data
+
+    if user_msgs and user_msgs[0].get('content'):
+        content = str(user_msgs[0].get('content')).strip()
+        first_line = content.split('\n')[0].strip()
+        provisional_title = first_line[:50] if len(first_line) > 50 else first_line
+        if provisional_title:
+            confidence = 0.5
+
+    # SELECT-only: get first assistant message for brief
+    assistant_msgs = supabase.table('raw_messages').select('content').eq('conversation_id', conversation_id).eq('role', 'assistant').gte('sequence', first_seq).lte('sequence', window_last_seq).order('sequence', desc=False).limit(1).execute().data
+
+    if assistant_msgs and assistant_msgs[0].get('content'):
+        content = str(assistant_msgs[0].get('content')).strip()
+        first_sentence = content.split('.')[0].strip()
+        provisional_brief = first_sentence[:200] if len(first_sentence) > 200 else first_sentence
+        if provisional_brief and provisional_title:
+            confidence = 0.6
+
+    rule_engine_result = build_rule_engine_result_namespace(
+        job_type='provisional_enrichment',
+        output_type='provisional_enrichment_result',
+        output={
+            'type': 'provisional_enrichment_result',
+            'pack_id': pack_id,
+            'provisional_title': provisional_title,
+            'provisional_brief': provisional_brief,
+            'enrichment_source': 'rule',
+            'confidence': confidence,
+            'reason': 'rule: first_message_seq_extraction'
+        }
+    )
+
+    record_rule_engine_diagnostics(supabase, job_id, pack_id, rule_engine_result)
+    logger.info(f'Job {job_id}: provisional_enrichment source=rule confidence={confidence}')
+
+
 def process_job(supabase: Client, job: Dict[str, Any]) -> bool:
     """
     Process a job based on job_type.
-    v1: post_pack_diagnostics, flow_change_detection, over_segmentation_check enabled.
+    v1: post_pack_diagnostics, flow_change_detection, over_segmentation_check, under_segmentation_check, provisional_enrichment enabled.
     
     Returns True if successful, False otherwise.
     """
@@ -343,13 +505,21 @@ def process_job(supabase: Client, job: Dict[str, Any]) -> bool:
         elif job_type == 'over_segmentation_check':
             # #201 P1: over segmentation check (rule-based)
             handle_over_segmentation_check(supabase, job_id, pack_id, payload)
+
+        elif job_type == 'under_segmentation_check':
+            # #201 P2: under segmentation check (rule-based)
+            handle_under_segmentation_check(supabase, job_id, pack_id, payload)
+
+        elif job_type == 'provisional_enrichment':
+            # #201 P2: provisional enrichment (rule-based only)
+            handle_provisional_enrichment(supabase, job_id, pack_id, payload)
             
         elif job_type == 'shadow_baseline':
             # v1: Sampling only - just log for now
             logger.info(f'Job {job_id}: shadow_baseline (sampling mode, no-op)')
             
         else:
-            # Future gated job types (under_segmentation_check, provisional_enrichment, expensive_handoff_eval)
+            # Future gated job types (expensive_handoff_eval)
             logger.warning(f'Job {job_id}: job_type {job_type} not enabled in v1, skipping')
             mark_job_skipped(supabase, job_id, f'{job_type} not enabled in v1')
             return True
