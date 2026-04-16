@@ -7,7 +7,7 @@ Render Standard Background Worker for:
 - Shadow baseline comparison (sampling only)
 - Queue-based async processing
 - #201 P1: flow_change_detection, over_segmentation_check (rule-based)
-- #201 P2: under_segmentation_check, provisional_enrichment (rule-based)
+- #201 P2: under_segmentation_check, provisional_enrichment (rule-based + model-assisted)
 
 v1 Constraints:
 - NO context_packs modification
@@ -18,11 +18,12 @@ v1 Constraints:
 
 import os
 import time
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
-# Supabase client
+import httpx
 from supabase import create_client, Client
 
 # Configure logging
@@ -33,7 +34,7 @@ logging.basicConfig(
 logger = logging.getLogger('5by-pack-worker')
 
 # Worker version
-WORKER_VERSION = 'v0.3.0'
+WORKER_VERSION = 'v0.4.0'
 
 # Polling interval (seconds)
 POLL_INTERVAL = 10
@@ -146,6 +147,18 @@ def build_rule_engine_result_namespace(job_type: str, output_type: str, output: 
         'diagnostic_only': True,
         'created_at': created_at
     }
+
+
+def build_rule_engine_result_with_engine_metadata(
+    job_type: str,
+    output_type: str,
+    output: Dict[str, Any],
+    engine_metadata: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Build SPEC-201 compliant namespace with engine_metadata."""
+    base = build_rule_engine_result_namespace(job_type, output_type, output)
+    base['engine_metadata'] = engine_metadata
+    return base
 
 
 def record_rule_engine_diagnostics(
@@ -388,24 +401,210 @@ def handle_under_segmentation_check(supabase: Client, job_id: str, pack_id: Opti
     logger.info(f'Job {job_id}: under_segmentation_check merge_candidate_detected={merge_candidate_detected}')
 
 
+def aggregate_pack_messages_for_enrichment(
+    supabase: Client,
+    conversation_id: str,
+    first_seq: int,
+    last_seq: Optional[int]
+) -> Dict[str, Any]:
+    """
+    Aggregate pack messages (SELECT-only) for enrichment.
+    - role: user|assistant only
+    - sequence ASC
+    - cap: max 20 messages OR 4000 chars (whichever hits first)
+    """
+    max_messages = 20
+    max_chars = 4000
+    window_last_seq = last_seq if last_seq is not None else first_seq + 50
+
+    rows = supabase.table('raw_messages').select(
+        'sequence, role, content'
+    ).eq(
+        'conversation_id', conversation_id
+    ).gte(
+        'sequence', first_seq
+    ).lte(
+        'sequence', window_last_seq
+    ).order(
+        'sequence', desc=False
+    ).limit(200).execute().data
+
+    messages = []
+    aggregated_len = 0
+
+    for r in rows or []:
+        role = r.get('role')
+        if role not in ('user', 'assistant'):
+            continue
+
+        content = str(r.get('content') or '').strip()
+        if not content:
+            continue
+
+        remaining = max_chars - aggregated_len
+        if remaining <= 0:
+            break
+
+        if len(content) > remaining:
+            content = content[:remaining]
+
+        messages.append({'role': role, 'content': content})
+        aggregated_len += len(content)
+
+        if len(messages) >= max_messages or aggregated_len >= max_chars:
+            break
+
+    return {
+        'messages': messages,
+        'aggregated_text_length': aggregated_len,
+        'message_count': len(messages)
+    }
+
+
+def parse_hf_enrichment_response(text: str) -> Dict[str, Any]:
+    """
+    Strict JSON parsing for HF enrichment response.
+    Expected: { "provisional_title": "...", "provisional_brief": "..." }
+    
+    Raises ValueError on:
+    - JSON parse failure
+    - missing required fields
+    - empty strings
+    """
+    try:
+        parsed = json.loads(text)
+    except Exception as e:
+        raise ValueError('invalid_response: json_parse_failed') from e
+
+    title = str(parsed.get('provisional_title') or '').strip()
+    brief = str(parsed.get('provisional_brief') or '').strip()
+
+    if not title or not brief:
+        raise ValueError('invalid_response: missing_required_fields')
+
+    return {
+        'provisional_title': title[:100],
+        'provisional_brief': brief[:500]
+    }
+
+
+def call_hf_provisional_enrichment(aggregated: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    HuggingFace Inference API call for provisional enrichment.
+    - timeout: 30s
+    - retry: max 2
+    - strict JSON response expected
+    
+    Env: HF_API_URL, HF_API_TOKEN
+    
+    Raises:
+    - RuntimeError('provider_not_configured') if env missing
+    - TimeoutError('timeout') on timeout
+    - RuntimeError('provider_error') on HTTP errors
+    - ValueError('invalid_response: ...') on parse failures
+    """
+    api_url = os.getenv('HF_API_URL')
+    api_token = os.getenv('HF_API_TOKEN')
+
+    if not api_url or not api_token:
+        raise RuntimeError('provider_not_configured')
+
+    model_name = 'google/flan-t5-small'
+
+    prompt_lines = [
+        'You are a conversation summarizer.',
+        '',
+        'Given the following conversation messages, output ONLY a JSON object with these fields:',
+        '- provisional_title: a short title (max 10 words, max 100 characters)',
+        '- provisional_brief: a one-sentence summary (max 30 words, max 500 characters)',
+        '',
+        'Output JSON only, no explanation.',
+        ''
+    ]
+
+    for m in aggregated.get('messages', []):
+        role = m.get('role')
+        content = m.get('content')
+        if role in ('user', 'assistant') and content:
+            prompt_lines.append(f'{role}: {content}')
+
+    prompt_lines.append('')
+    prompt_lines.append('Output JSON only:')
+    prompt = '\n'.join(prompt_lines)
+
+    timeout_seconds = 30
+    retry_count = 2
+
+    headers = {
+        'Authorization': f'Bearer {api_token}',
+        'Content-Type': 'application/json'
+    }
+    payload = {'inputs': prompt}
+
+    last_exc = None
+    for attempt in range(retry_count + 1):
+        try:
+            with httpx.Client(timeout=timeout_seconds) as client:
+                resp = client.post(api_url, headers=headers, json=payload)
+                if resp.status_code != 200:
+                    raise RuntimeError(f'provider_error: status={resp.status_code}')
+
+                data = resp.json()
+
+                # HF text generation returns: [{ "generated_text": "..." }]
+                generated = ''
+                if isinstance(data, list) and data and isinstance(data[0], dict):
+                    generated = str(data[0].get('generated_text') or '').strip()
+                elif isinstance(data, dict):
+                    generated = str(data.get('generated_text') or '').strip()
+
+                if not generated:
+                    raise ValueError('invalid_response: empty_generated_text')
+
+                parsed = parse_hf_enrichment_response(generated)
+                parsed['model_provider'] = 'huggingface'
+                parsed['model_name'] = model_name
+                return parsed
+
+        except httpx.TimeoutException as e:
+            last_exc = e
+            if attempt >= retry_count:
+                raise TimeoutError('timeout') from e
+        except ValueError as e:
+            last_exc = e
+            if attempt >= retry_count:
+                raise
+        except Exception as e:
+            last_exc = e
+            if attempt >= retry_count:
+                raise
+
+    raise RuntimeError('provider_error') from last_exc
+
+
 def handle_provisional_enrichment(supabase: Client, job_id: str, pack_id: Optional[str], payload: Dict[str, Any]) -> None:
     """
-    #201 P2: provisional_enrichment handler (rule-based only).
+    #201 P2: provisional_enrichment handler (rule-based + model-assisted).
 
-    P2 scope: rule only. LLM mode is gated (off until B document activation).
+    Modes:
+    - enrichment_mode='llm': force model path
+    - enrichment_mode='auto': model if activation met, else rule fallback
+    - enrichment_mode='rule': rule-only
+
+    Activation conditions (auto mode):
+    - message_count >= 5
+    - aggregated_text_length >= 500
 
     Access path:
     1. context_packs: first_message_seq, last_message_seq
     2. raw_messages: conversation_id + sequence window
-       - role='user' -> provisional_title
-       - role='assistant' -> provisional_brief
 
     CRITICAL: provisional_title/brief are diagnostic-only recommendations.
     They do NOT update context_packs.title directly.
     Canonical promotion requires separate Gate.
 
     Canonical tables: SELECT-only (no write).
-    Output: worker_diagnostics.rule_engine_result JSONB.
+    Output: worker_diagnostics.rule_engine_result JSONB with engine_metadata.
     """
     conversation_id = validate_required_payload_fields(supabase, job_id, pack_id, payload)
     if not conversation_id:
@@ -413,13 +612,11 @@ def handle_provisional_enrichment(supabase: Client, job_id: str, pack_id: Option
 
     enrichment_mode = payload.get('enrichment_mode', 'rule')
 
-    # P2: LLM mode is gated (not enabled)
-    if enrichment_mode == 'llm':
-        mark_job_skipped(supabase, job_id, 'llm mode not enabled in P2 (gated)')
-        return
-
     # SELECT-only: get current pack with first_message_seq
-    current_pack = supabase.table('context_packs').select('id, conversation_id, first_message_seq, last_message_seq').eq('id', pack_id).single().execute().data
+    current_pack = supabase.table('context_packs').select(
+        'id, conversation_id, first_message_seq, last_message_seq'
+    ).eq('id', pack_id).single().execute().data
+    
     if not current_pack or current_pack.get('conversation_id') != conversation_id:
         mark_job_failed(supabase, job_id, 'invalid_payload: pack not found or conversation mismatch')
         return
@@ -430,16 +627,88 @@ def handle_provisional_enrichment(supabase: Client, job_id: str, pack_id: Option
         mark_job_failed(supabase, job_id, 'invalid_payload: pack has no first_message_seq')
         return
 
+    # SELECT-only aggregation for activation + model input
+    aggregated = aggregate_pack_messages_for_enrichment(
+        supabase=supabase,
+        conversation_id=conversation_id,
+        first_seq=int(first_seq),
+        last_seq=int(last_seq) if last_seq is not None else None
+    )
+
+    message_count = int(aggregated.get('message_count') or 0)
+    aggregated_text_length = int(aggregated.get('aggregated_text_length') or 0)
+
     provisional_title = None
     provisional_brief = None
     confidence = 0.3
 
     window_last_seq = last_seq if last_seq else first_seq + 10
 
-    # SELECT-only: get first user message for title
-    user_msgs = supabase.table('raw_messages').select('content').eq('conversation_id', conversation_id).eq('role', 'user').gte('sequence', first_seq).lte('sequence', window_last_seq).order('sequence', desc=False).limit(1).execute().data
+    engine_kind = 'rule'
+    model_provider = None
+    model_name = None
+    fallback_used = False
+    fallback_reason = None
+    latency_ms = None
+    activation_mode = 'rule'
 
-    if user_msgs and user_msgs[0].get('content'):
+    should_try_model = False
+    if enrichment_mode == 'llm':
+        should_try_model = True
+        activation_mode = 'llm'
+    elif enrichment_mode == 'auto':
+        activation_mode = 'auto'
+        if message_count >= 5 and aggregated_text_length >= 500:
+            should_try_model = True
+        else:
+            fallback_used = True
+            fallback_reason = 'activation_not_met'
+    else:
+        activation_mode = 'rule'
+
+    # Model-assisted path (HF) with fallback to rule
+    if should_try_model:
+        started = time.time()
+        try:
+            result = call_hf_provisional_enrichment(aggregated)
+            provisional_title = result.get('provisional_title')
+            provisional_brief = result.get('provisional_brief')
+            engine_kind = 'model'
+            model_provider = result.get('model_provider')
+            model_name = result.get('model_name')
+            confidence = 0.7
+        except RuntimeError as e:
+            msg = str(e)
+            fallback_used = True
+            if msg == 'provider_not_configured':
+                fallback_reason = 'provider_not_configured'
+            elif msg.startswith('provider_error'):
+                fallback_reason = 'provider_error'
+            else:
+                fallback_reason = 'provider_error'
+        except TimeoutError:
+            fallback_used = True
+            fallback_reason = 'timeout'
+        except ValueError:
+            fallback_used = True
+            fallback_reason = 'invalid_response'
+        except Exception:
+            # unexpected exceptions should fail the job
+            raise
+        finally:
+            latency_ms = int((time.time() - started) * 1000)
+
+    # Rule fallback or rule primary (existing rule-based extraction)
+    # SELECT-only: get first user message for title
+    user_msgs = supabase.table('raw_messages').select('content').eq(
+        'conversation_id', conversation_id
+    ).eq('role', 'user').gte(
+        'sequence', first_seq
+    ).lte(
+        'sequence', window_last_seq
+    ).order('sequence', desc=False).limit(1).execute().data
+
+    if provisional_title is None and user_msgs and user_msgs[0].get('content'):
         content = str(user_msgs[0].get('content')).strip()
         first_line = content.split('\n')[0].strip()
         provisional_title = first_line[:50] if len(first_line) > 50 else first_line
@@ -447,16 +716,34 @@ def handle_provisional_enrichment(supabase: Client, job_id: str, pack_id: Option
             confidence = 0.5
 
     # SELECT-only: get first assistant message for brief
-    assistant_msgs = supabase.table('raw_messages').select('content').eq('conversation_id', conversation_id).eq('role', 'assistant').gte('sequence', first_seq).lte('sequence', window_last_seq).order('sequence', desc=False).limit(1).execute().data
+    assistant_msgs = supabase.table('raw_messages').select('content').eq(
+        'conversation_id', conversation_id
+    ).eq('role', 'assistant').gte(
+        'sequence', first_seq
+    ).lte(
+        'sequence', window_last_seq
+    ).order('sequence', desc=False).limit(1).execute().data
 
-    if assistant_msgs and assistant_msgs[0].get('content'):
+    if provisional_brief is None and assistant_msgs and assistant_msgs[0].get('content'):
         content = str(assistant_msgs[0].get('content')).strip()
         first_sentence = content.split('.')[0].strip()
         provisional_brief = first_sentence[:200] if len(first_sentence) > 200 else first_sentence
         if provisional_brief and provisional_title:
             confidence = 0.6
 
-    rule_engine_result = build_rule_engine_result_namespace(
+    enrichment_source = 'model' if engine_kind == 'model' else 'rule'
+
+    engine_metadata = {
+        'engine_kind': engine_kind,
+        'model_provider': model_provider,
+        'model_name': model_name,
+        'fallback_used': fallback_used,
+        'fallback_reason': fallback_reason,
+        'latency_ms': latency_ms,
+        'activation_mode': activation_mode
+    }
+
+    rule_engine_result = build_rule_engine_result_with_engine_metadata(
         job_type='provisional_enrichment',
         output_type='provisional_enrichment_result',
         output={
@@ -464,14 +751,15 @@ def handle_provisional_enrichment(supabase: Client, job_id: str, pack_id: Option
             'pack_id': pack_id,
             'provisional_title': provisional_title,
             'provisional_brief': provisional_brief,
-            'enrichment_source': 'rule',
+            'enrichment_source': enrichment_source,
             'confidence': confidence,
             'reason': 'rule: first_message_seq_extraction'
-        }
+        },
+        engine_metadata=engine_metadata
     )
 
     record_rule_engine_diagnostics(supabase, job_id, pack_id, rule_engine_result)
-    logger.info(f'Job {job_id}: provisional_enrichment source=rule confidence={confidence}')
+    logger.info(f'Job {job_id}: provisional_enrichment source={enrichment_source} fallback_used={fallback_used} confidence={confidence}')
 
 
 def process_job(supabase: Client, job: Dict[str, Any]) -> bool:
@@ -511,7 +799,7 @@ def process_job(supabase: Client, job: Dict[str, Any]) -> bool:
             handle_under_segmentation_check(supabase, job_id, pack_id, payload)
 
         elif job_type == 'provisional_enrichment':
-            # #201 P2: provisional enrichment (rule-based only)
+            # #201 P2: provisional enrichment (rule-based + model-assisted)
             handle_provisional_enrichment(supabase, job_id, pack_id, payload)
             
         elif job_type == 'shadow_baseline':
