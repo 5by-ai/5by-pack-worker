@@ -2,3 +2,8 @@
 supabase>=2.0.0
 httpx>=0.25.0
 python-dotenv>=1.0.0
+
+# Local Model Dependencies (Slice 1)
+transformers>=4.35.0
+torch>=2.0.0
+sentencepiece>=0.1.99
